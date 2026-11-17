@@ -1,0 +1,56 @@
+name: Solar Predictor
+version: "0.1.0"
+slug: solar_predictor
+description: Learns your home's solar production and consumption from HA history and Open-Meteo weather, then forecasts solar, usage and grid draw.
+url: https://github.com/pats-coder/solar-predictor
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+homeassistant_api: true
+options:
+  production_stat: sensor.envoy_lifetime_energy_production
+  consumption_stat: sensor.envoy_lifetime_energy_consumption
+  grid_import_stat: sensor.envoy_lifetime_net_energy_consumption
+  benchmark_today: sensor.solcast_pv_forecast_forecast_today
+  benchmark_tomorrow: sensor.solcast_pv_forecast_forecast_tomorrow
+  arrays:
+    - name: north
+      azimuth: 0
+      tilt: 20
+    - name: east
+      azimuth: 90
+      tilt: 20
+    - name: west
+      azimuth: 270
+      tilt: 20
+  free_start: "11:00"
+  free_end: "14:00"
+  battery_kwh: 0
+  battery_reserve_pct: 10
+  battery_max_kw: 5
+  history_start: "2026-02-01"
+  holiday_subdiv: NSW
+  update_minutes: 15
+  log_level: info
+schema:
+  production_stat: str
+  consumption_stat: str
+  grid_import_stat: str
+  benchmark_today: str?
+  benchmark_tomorrow: str?
+  arrays:
+    - name: str
+      azimuth: float
+      tilt: float
+  free_start: match(^\d{2}:\d{2}$)
+  free_end: match(^\d{2}:\d{2}$)
+  battery_kwh: float
+  battery_reserve_pct: int(0,100)
+  battery_max_kw: float
+  history_start: match(^\d{4}-\d{2}-\d{2}$)
+  holiday_subdiv: str
+  update_minutes: int(5,120)
+  log_level: list(debug|info|warning)
