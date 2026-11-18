@@ -22,7 +22,7 @@ MODEL_PATH = os.path.join(DATA, "model.pkl")
 WX_CACHE = os.path.join(DATA, "weather_hist.pkl")
 TRACK_PATH = os.path.join(DATA, "tracking.json")
 PREFIX = "sensor.solar_predictor_"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 log = logging.getLogger("solar_predictor")
 
@@ -234,6 +234,7 @@ class App:
                  "icon": "mdi:transmission-tower-import", "including_free_window": t_tom["grid"]})
         self.put("next_grid_draw", next_draw or "unknown", {"device_class": "timestamp",
                  "friendly_name": "Solar Predictor Next Paid Grid Draw", "icon": "mdi:clock-alert-outline"})
+        self.last_error = None  # reaching here means this cycle succeeded
         bt = m.backtest or {}
         pct = {"unit_of_measurement": "%", "state_class": "measurement", "icon": "mdi:bullseye-arrow"}
         self.put("accuracy_solar", bt.get("solar", "unknown"), {**pct, "friendly_name": "Solar Predictor Backtest Accuracy Solar",
