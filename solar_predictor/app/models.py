@@ -123,10 +123,13 @@ class Predictor:
         self.m_solar = _gbr().fit(Xs.loc[day, self.solar_cols], act.loc[day, "solar"])
         solar_hat = self.predict_solar(wx)
 
+        age = (act.index.max() - act.index).total_seconds() / 86400
+        recency = pd.Series(0.25 + 0.5 ** (age / 45.0), index=act.index)  # favour recent weeks (seasonal drift)
+
         Xc = self._cf(wx, act["base"].dropna(), solar_hat)
         self.cons_cols = list(Xc.columns)
         ok = act["base"].notna() & Xc["lag_daily_7d"].notna()
-        self.m_cons = _gbr().fit(Xc.loc[ok, self.cons_cols], act.loc[ok, "base"])
+        self.m_cons = _gbr().fit(Xc.loc[ok, self.cons_cols], act.loc[ok, "base"], sample_weight=recency[ok])
 
         self.m_ev = None
         if act["ev"].notna().sum() > 24 * 30:
@@ -138,7 +141,8 @@ class Predictor:
             y = act.loc[oke, "ev"]
             on = y > 0.5
             clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, min_samples_leaf=10,
-                                                 random_state=0).fit(Xe.loc[oke, self.ev_cols], on)
+                                                 random_state=0).fit(Xe.loc[oke, self.ev_cols], on,
+                                                                     sample_weight=recency[oke])
             reg = _gbr(min_samples_leaf=5).fit(Xe.loc[oke][on.values][self.ev_cols], y[on]) if on.sum() > 20 else None
             self.m_ev = (clf, reg, float(y[on].mean()) if on.any() else 0.0)
 
@@ -166,13 +170,18 @@ class Predictor:
         else:
             ev = np.zeros(len(wx))
         cons = base + ev
-        Xg = self._gf(cons, solar.values, ev, wx.index)
-        grid = np.clip(self.m_grid.predict(Xg[self.grid_cols]), 0, None)
-        grid = np.minimum(grid, cons)  # can't import more than the house uses (no battery)
+        grid = self.predict_grid(cons, solar.values, ev, wx.index)
         return pd.DataFrame({"solar": solar.values, "base": base, "ev": ev, "cons": cons, "grid": grid},
                             index=wx.index)
 
     def predict_grid(self, cons, solar, ev, idx) -> np.ndarray:
+        """Grid import. Forecast EV charging outside the free window is treated as solar-only
+        (that's how the charging automations behave), so it never adds paid import."""
+        cons, ev = np.asarray(cons, float), np.asarray(ev, float)
+        free = self.in_free(idx)
+        ev_grid = np.where(free, ev, 0.0)
+        cons = cons - ev + ev_grid
+        ev = ev_grid
         Xg = self._gf(cons, solar, ev, idx)
         g = np.clip(self.m_grid.predict(Xg[self.grid_cols]), 0, None)
         return np.minimum(g, np.asarray(cons, float))

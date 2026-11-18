@@ -37,8 +37,17 @@ class HA:
         return r.json()
 
     def set_state(self, entity_id: str, state, attributes: dict) -> None:
-        r = self.s.post(f"{self.rest}/states/{entity_id}",
-                        data=json.dumps({"state": state, "attributes": attributes}, default=str), timeout=30)
+        def clean(o):
+            if isinstance(o, float) and o != o:
+                return None
+            if isinstance(o, dict):
+                return {k: clean(v) for k, v in o.items()}
+            if isinstance(o, list):
+                return [clean(v) for v in o]
+            return o
+        body = json.dumps({"state": "unknown" if state is None else state, "attributes": clean(attributes)},
+                          default=str, allow_nan=False)
+        r = self.s.post(f"{self.rest}/states/{entity_id}", data=body, timeout=30)
         r.raise_for_status()
 
     # ---------- websocket statistics ----------

@@ -22,7 +22,7 @@ MODEL_PATH = os.path.join(DATA, "model.pkl")
 WX_CACHE = os.path.join(DATA, "weather_hist.pkl")
 TRACK_PATH = os.path.join(DATA, "tracking.json")
 PREFIX = "sensor.solar_predictor_"
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 log = logging.getLogger("solar_predictor")
 
@@ -250,7 +250,8 @@ class App:
 
         # merge actuals for completed hours today
         merged = pred.copy()
-        merged.loc[done, ["solar", "cons", "grid"]] = act.loc[done, ["solar", "cons", "grid"]].values
+        merged.loc[done, ["solar", "cons", "grid"]] = act.loc[done, ["solar", "cons", "grid"]].fillna(
+            pred.loc[done, ["solar", "cons", "grid"]]).values
         if "ev" in act:
             merged.loc[done, "ev"] = act.loc[done, "ev"].fillna(0).values
         merged.loc[done, "base"] = (merged.loc[done, "cons"] - merged.loc[done, "ev"]).clip(lower=0)
@@ -271,8 +272,10 @@ class App:
 
         def hourly(day0, days=2):
             sel = (loc_idx >= day0) & (loc_idx < day0 + pd.Timedelta(days=days))
-            return [{"start": t.tz_convert(self.tz).isoformat(), "solar": round(r.solar, 3),
-                     "consumption": round(r.cons, 3), "ev_charging": round(r.ev, 3), "grid": round(r.grid, 3),
+            def v(x):
+                return None if pd.isna(x) else round(float(x), 3)
+            return [{"start": t.tz_convert(self.tz).isoformat(), "solar": v(r.solar),
+                     "consumption": v(r.cons), "ev_charging": v(r.ev), "grid": v(r.grid),
                      "free_window": bool(r.free), "actual": bool(r.actual)}
                     for t, r in merged.loc[sel].iterrows()]
 

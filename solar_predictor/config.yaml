@@ -1,5 +1,5 @@
 name: Solar Predictor
-version: "0.2.1"
+version: "0.2.2"
 slug: solar_predictor
 description: Learns your home's solar production and consumption from HA history and Open-Meteo weather, then forecasts solar, usage and grid draw.
 url: https://github.com/pats-coder/solar-predictor
