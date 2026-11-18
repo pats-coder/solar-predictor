@@ -72,14 +72,28 @@ def history(lat, lon, arrays, start: date, end: date, cache_path: str | None = N
         elif len(cached):
             # refetch the last 3 days in case they were incomplete
             start = max(start, (cached.index.max() - pd.Timedelta(days=3)).date())
+    # the archive lags a few days; recent days come from the live API's past_days
+    end = min(end, date.today() - timedelta(days=3))
     frames = []
     s = start
     while s <= end:
         e = min(s + timedelta(days=89), end)
         log.info("Fetching archived weather %s..%s", s, e)
-        frames.append(_fetch(HIST_URL, lat, lon, arrays, {"start_date": s.isoformat(), "end_date": e.isoformat()}))
+        try:
+            frames.append(_fetch(HIST_URL, lat, lon, arrays, {"start_date": s.isoformat(), "end_date": e.isoformat()}))
+        except Exception as ex:  # noqa: BLE001
+            log.warning("Archived weather %s..%s unavailable (%s); skipping", s, e, ex)
         s = e + timedelta(days=1)
-    df = pd.concat(([cached] if cached is not None else []) + frames)
+    try:
+        recent = _fetch(FC_URL, lat, lon, arrays, {"forecast_days": 1, "past_days": 7})
+        recent = recent[recent.index < pd.Timestamp.now(tz="UTC").floor("h")]
+        frames.append(recent)
+    except Exception as ex:  # noqa: BLE001
+        log.warning("Recent weather unavailable (%s)", ex)
+    parts = ([cached] if cached is not None else []) + frames
+    if not parts:
+        raise RuntimeError("No weather history available from Open-Meteo")
+    df = pd.concat(parts)
     df = df[~df.index.duplicated(keep="last")].sort_index()
     if cache_path:
         df.to_pickle(cache_path)
