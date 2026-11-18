@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
 from features import consumption_features, ev_features, solar_features
 
@@ -61,7 +61,8 @@ class Predictor:
     solar_cols: list = field(default_factory=list)
     cons_cols: list = field(default_factory=list)
     ev_cols: list = field(default_factory=list)
-    grid_cols: list = field(default_factory=lambda: ["cons", "solar", "deficit", "surplus", "hour", "ev"])
+    grid_cols: list = field(default_factory=lambda: ["cons", "base", "ev", "solar", "deficit", "base_deficit",
+                                                     "surplus", "hour", "free"])
     trained_rows: int = 0
     backtest: dict = field(default_factory=dict)
 
@@ -81,10 +82,11 @@ class Predictor:
 
     def _gf(self, cons, solar, ev, idx):
         loc = idx.tz_convert(self.tz)
-        c, s = np.asarray(cons, float), np.asarray(solar, float)
-        return pd.DataFrame({"cons": c, "solar": s, "deficit": np.maximum(c - s, 0),
-                             "surplus": np.maximum(s - c, 0), "hour": loc.hour.values,
-                             "ev": np.asarray(ev, float)}, index=idx)
+        c, s, e = np.asarray(cons, float), np.asarray(solar, float), np.asarray(ev, float)
+        b = c - e
+        return pd.DataFrame({"cons": c, "base": b, "ev": e, "solar": s, "deficit": np.maximum(c - s, 0),
+                             "base_deficit": np.maximum(b - s, 0), "surplus": np.maximum(s - c, 0),
+                             "hour": loc.hour.values, "free": self.in_free(idx).astype(int)}, index=idx)
 
     # ---------- solar ----------
     def predict_solar(self, wx: pd.DataFrame) -> pd.Series:
@@ -132,7 +134,13 @@ class Predictor:
             self.ev_cols = list(Xe.columns)
             oke = act["ev"].notna() & Xe["lag_daily_7d"].notna()
             self.ev_cap = float(act["ev"].max() * 1.05)
-            self.m_ev = _gbr(min_samples_leaf=10).fit(Xe.loc[oke, self.ev_cols], act.loc[oke, "ev"])
+            # charging is all-or-nothing: classify "charging this hour", then size it when charging
+            y = act.loc[oke, "ev"]
+            on = y > 0.5
+            clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, min_samples_leaf=10,
+                                                 random_state=0).fit(Xe.loc[oke, self.ev_cols], on)
+            reg = _gbr(min_samples_leaf=5).fit(Xe.loc[oke][on.values][self.ev_cols], y[on]) if on.sum() > 20 else None
+            self.m_ev = (clf, reg, float(y[on].mean()) if on.any() else 0.0)
 
         g = act[["cons", "solar", "grid"]].join(act["ev"].fillna(0)).dropna()
         Xg = self._gf(g["cons"], g["solar"], g["ev"], g.index)
@@ -151,7 +159,10 @@ class Predictor:
                 loc = wx.index.tz_convert(self.tz)
                 today = pd.Timestamp.now(tz=self.tz).normalize()
                 Xe.loc[(loc >= today) & (loc < today + pd.Timedelta(days=1)), "soc_eve"] = live_soc
-            ev = np.clip(self.m_ev.predict(Xe[self.ev_cols]), 0, self.ev_cap or None)
+            clf, reg, typical = self.m_ev
+            p_on = clf.predict_proba(Xe[self.ev_cols])[:, 1]
+            size = reg.predict(Xe[self.ev_cols]) if reg is not None else np.full(len(Xe), typical)
+            ev = np.where(p_on >= 0.5, np.clip(size, 0, self.ev_cap or None), 0.0)
         else:
             ev = np.zeros(len(wx))
         cons = base + ev
@@ -160,6 +171,11 @@ class Predictor:
         grid = np.minimum(grid, cons)  # can't import more than the house uses (no battery)
         return pd.DataFrame({"solar": solar.values, "base": base, "ev": ev, "cons": cons, "grid": grid},
                             index=wx.index)
+
+    def predict_grid(self, cons, solar, ev, idx) -> np.ndarray:
+        Xg = self._gf(cons, solar, ev, idx)
+        g = np.clip(self.m_grid.predict(Xg[self.grid_cols]), 0, None)
+        return np.minimum(g, np.asarray(cons, float))
 
     def in_free(self, idx: pd.DatetimeIndex) -> np.ndarray:
         loc = idx.tz_convert(self.tz)

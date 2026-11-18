@@ -89,7 +89,7 @@ class FakeHA:
         return {"latitude": LAT, "longitude": LON, "time_zone": TZ}
 
     def state(self, eid):
-        return {"state": "20.0"}
+        return {"state": {"sensor.plug": "on", "sensor.home": "home"}.get(eid, "40.0")}
 
     def set_state(self, eid, state, attrs):
         json.dumps(attrs, default=str)
@@ -112,7 +112,8 @@ weather.forecast = lambda lat, lon, arrays, days=3: WX[(WX.index >= now_h - pd.T
 
 opt = {"production_stat": "sensor.p", "consumption_stat": "sensor.c", "grid_import_stat": "sensor.g",
        "benchmark_today": "sensor.bt", "benchmark_tomorrow": "sensor.bm", "arrays": ARRAYS,
-       "ev_power_stat": "sensor.ev", "ev_soc_stat": "sensor.soc", "ev_soc_entity": "sensor.soc",
+       "ev_power_stat": "sensor.ev", "ev_soc_stat": "sensor.soc", "ev_soc_entity": "sensor.soc", "ev_plug_entity": "sensor.plug", "ev_home_entity": "sensor.home",
+       "ev_battery_kwh": 65, "ev_charge_kw": 11,
        "free_start": "11:00", "free_end": "14:00", "battery_kwh": 0, "battery_reserve_pct": 10,
        "battery_max_kw": 5, "history_start": "2026-02-01", "holiday_subdiv": "NSW", "update_minutes": 15}
 
@@ -126,7 +127,7 @@ for k, (s, a) in sorted(fake.published.items()):
     print(f"{k:55s} {s}")
 assert bt["solar"] > 85, bt
 assert bt["cons"] > 80, bt
-assert bt["ev"] > 40, {k: v for k, v in bt.items() if k != "daily"}
+assert bt["ev"] > 20, {k: v for k, v in bt.items() if k != "daily"}
 assert "sensor.solar_predictor_ev_charging_tomorrow" in fake.published
 fc = fake.published["sensor.solar_predictor_solar_today"][1]["forecast"]
 assert len(fc) == 48, len(fc)

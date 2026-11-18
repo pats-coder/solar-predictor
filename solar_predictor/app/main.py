@@ -22,7 +22,7 @@ MODEL_PATH = os.path.join(DATA, "model.pkl")
 WX_CACHE = os.path.join(DATA, "weather_hist.pkl")
 TRACK_PATH = os.path.join(DATA, "tracking.json")
 PREFIX = "sensor.solar_predictor_"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 log = logging.getLogger("solar_predictor")
 
@@ -154,6 +154,45 @@ class App:
                          if p["bench_solar"].notna().any() else None}
         return res
 
+    def _num(self, key: str) -> float | None:
+        eid = self.opt.get(key)
+        st = self.ha.state(eid) if eid else None
+        try:
+            return float(st["state"]) if st else None
+        except (TypeError, ValueError):
+            return None
+
+    def _st(self, key: str) -> str | None:
+        eid = self.opt.get(key)
+        st = self.ha.state(eid) if eid else None
+        return st["state"] if st else None
+
+    def live_ev_plan(self, now: pd.Timestamp, idx: pd.DatetimeIndex) -> np.ndarray | None:
+        """Expected EV kWh per remaining hour today, from plug/home/charge-level state.
+        Returns None when the car's live state isn't configured or readable (model forecast stands)."""
+        if not (self.opt.get("ev_plug_entity") and self.opt.get("ev_soc_entity")):
+            return None
+        soc, plug = self._num("ev_soc_entity"), self._st("ev_plug_entity")
+        if soc is None or plug in (None, "unknown", "unavailable"):
+            return None
+        home = self._st("ev_home_entity") if self.opt.get("ev_home_entity") else "home"
+        limit = max(self._num("ev_limit_entity") or 80.0, 80.0)
+        cap = float(self.opt.get("ev_battery_kwh") or 0) or 65.0
+        kw = float(self.opt.get("ev_charge_kw") or 11.0)
+        plan = np.zeros(len(idx))
+        if plug != "on" or home != "home" or soc >= 95:
+            return plan
+        need = max(0.0, (limit - soc) / 100 * cap) / 0.9  # wall-side energy incl. charging losses
+        free = self.in_free(idx)
+        for i in np.where(free)[0]:
+            if need <= 0:
+                break
+            mins = 60 - (now.minute if idx[i] == now.tz_convert("UTC").floor("h") else 0)
+            e = min(need, kw * mins / 60)
+            plan[i] = e
+            need -= e
+        return plan
+
     # ---------- forecast cycle ----------
     def update(self) -> None:
         m = self.model
@@ -194,7 +233,13 @@ class App:
             w = min(1.0, b_done / (0.5 * pred.loc[is_today, "base"].sum()))
             bcorr = 1 + w * (ratio - 1)
         pred.loc[future_today, "base"] *= bcorr
+
+        # today's EV charging from the car's live state (mirrors the free-window charging automation)
+        ev_plan = self.live_ev_plan(now, pred.index[future_today])
+        if ev_plan is not None:
+            pred.loc[future_today, "ev"] = ev_plan
         pred["cons"] = pred["base"] + pred["ev"]
+        pred["grid"] = m.predict_grid(pred["cons"].values, pred["solar"].values, pred["ev"].values, pred.index)
 
         # battery (optional)
         if self.opt.get("battery_kwh", 0) > 0:
