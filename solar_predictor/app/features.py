@@ -105,3 +105,50 @@ def consumption_features(wx: pd.DataFrame, cons_hist: pd.Series, lat: float, lon
     f["lag_same_hour_7d"] = lag_same_hour
     f["lag_daily_7d"] = lag_day
     return f
+
+
+def _lag_tables(hist: pd.Series, day: pd.DatetimeIndex, hours: np.ndarray, tz: str):
+    """Mean same-hour and mean daily totals over local days D-8..D-2."""
+    h = hist.copy()
+    h.index = h.index.tz_convert(tz)
+    tbl = h.groupby([pd.DatetimeIndex(h.index.normalize()), h.index.hour]).sum().unstack()
+    daily = tbl.sum(axis=1, min_count=20)
+    same, dly = np.full(len(day), np.nan), np.full(len(day), np.nan)
+    cache: dict = {}
+    for i, (d, hr) in enumerate(zip(day, hours)):
+        if d not in cache:
+            win = tbl.loc[(tbl.index >= d - pd.Timedelta(days=8)) & (tbl.index <= d - pd.Timedelta(days=2))]
+            cache[d] = (win.mean(), daily.loc[win.index].mean()) if len(win) >= 3 else None
+        c = cache[d]
+        if c is not None:
+            same[i] = c[0].get(hr, np.nan)
+            dly[i] = c[1]
+    return same, dly
+
+
+def ev_features(wx: pd.DataFrame, tz: str, holidays_set, solar_pred: pd.Series, ev_hist: pd.Series,
+                soc_hist: pd.Series | None, free_start: float, free_end: float) -> pd.DataFrame:
+    """Features for hourly EV charging energy. Car state is taken as known at 8pm the evening
+    before each day (when the day-ahead forecast is logged), or the latest reading if later."""
+    f = _calendar(wx.index, tz, holidays_set)
+    loc = wx.index.tz_convert(tz)
+    hh = loc.hour.values + loc.minute.values / 60
+    f["free"] = (hh >= free_start) & (hh < free_end)
+    f["solar_pred"] = solar_pred.reindex(wx.index).values
+    day = pd.DatetimeIndex(loc.normalize())
+    f["solar_day"] = f["solar_pred"].groupby(day.values).transform("sum").values
+    f["solar_surplus_day"] = (f["solar_pred"] - 1.5).clip(lower=0).groupby(day.values).transform("sum").values
+    f["temp"] = wx["temperature_2m"].values
+    f["lag_same_hour_7d"], f["lag_daily_7d"] = _lag_tables(ev_hist, day, f["hour"].values, tz)
+    soc = np.full(len(f), np.nan)
+    if soc_hist is not None and soc_hist.notna().any():
+        s = soc_hist.dropna()
+        s.index = s.index.tz_convert(tz)
+        cache: dict = {}
+        for i, d in enumerate(day):
+            if d not in cache:
+                prior = s[s.index <= d - pd.Timedelta(hours=4)]
+                cache[d] = float(prior.iloc[-1]) if len(prior) else np.nan
+            soc[i] = cache[d]
+    f["soc_eve"] = soc
+    return f

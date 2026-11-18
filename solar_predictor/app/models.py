@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-from features import consumption_features, solar_features
+from features import consumption_features, ev_features, solar_features
 
 log = logging.getLogger("solar_predictor.models")
 
@@ -50,13 +50,18 @@ class Predictor:
     tz: str
     arrays: list
     holidays_set: object
+    free_start: float = 11.0
+    free_end: float = 14.0
     solar_cap: float = 0.0
+    ev_cap: float = 0.0
     m_solar: object = None
-    m_cons: object = None
+    m_cons: object = None   # base load (house minus EV charging when EV is metered)
+    m_ev: object = None
     m_grid: object = None
     solar_cols: list = field(default_factory=list)
     cons_cols: list = field(default_factory=list)
-    grid_cols: list = field(default_factory=lambda: ["cons", "solar", "deficit", "surplus", "hour"])
+    ev_cols: list = field(default_factory=list)
+    grid_cols: list = field(default_factory=lambda: ["cons", "solar", "deficit", "surplus", "hour", "ev"])
     trained_rows: int = 0
     backtest: dict = field(default_factory=dict)
 
@@ -64,15 +69,22 @@ class Predictor:
     def _sf(self, wx):
         return solar_features(wx, self.lat, self.lon, self.tz, self.arrays)
 
-    def _cf(self, wx, cons_hist, solar_pred):
-        return consumption_features(wx, cons_hist, self.lat, self.lon, self.tz, self.holidays_set, solar_pred)
+    def _cf(self, wx, base_hist, solar_pred):
+        f = consumption_features(wx, base_hist, self.lat, self.lon, self.tz, self.holidays_set, solar_pred)
+        day = pd.DatetimeIndex(wx.index.tz_convert(self.tz).normalize())
+        f["solar_day"] = f["solar_pred"].groupby(day.values).transform("sum").values
+        return f
 
-    @staticmethod
-    def _gf(cons, solar, idx, tz):
-        loc = idx.tz_convert(tz)
+    def _ef(self, wx, solar_pred, ev_hist, soc_hist):
+        return ev_features(wx, self.tz, self.holidays_set, solar_pred, ev_hist, soc_hist,
+                           self.free_start, self.free_end)
+
+    def _gf(self, cons, solar, ev, idx):
+        loc = idx.tz_convert(self.tz)
         c, s = np.asarray(cons, float), np.asarray(solar, float)
         return pd.DataFrame({"cons": c, "solar": s, "deficit": np.maximum(c - s, 0),
-                             "surplus": np.maximum(s - c, 0), "hour": loc.hour.values}, index=idx)
+                             "surplus": np.maximum(s - c, 0), "hour": loc.hour.values,
+                             "ev": np.asarray(ev, float)}, index=idx)
 
     # ---------- solar ----------
     def predict_solar(self, wx: pd.DataFrame) -> pd.Series:
@@ -82,36 +94,77 @@ class Predictor:
         p[X["sun_elev"].values <= SUN_MIN] = 0.0
         return pd.Series(p, index=wx.index, name="solar")
 
+    @staticmethod
+    def _split(act: pd.DataFrame, min_rows: int = 0) -> pd.DataFrame:
+        """Add 'base' = consumption minus metered EV charging."""
+        a = act.copy()
+        if "ev" in a and a["ev"].notna().sum() > min_rows:
+            ev = a["ev"].clip(lower=0)
+            a["ev"] = ev
+            a["base"] = (a["cons"] - ev.fillna(0)).clip(lower=0)
+            a.loc[ev.isna(), "base"] = np.nan
+        else:
+            a["ev"] = np.nan
+            a["base"] = a["cons"]
+        return a
+
     # ---------- training ----------
     def _fit(self, wx: pd.DataFrame, act: pd.DataFrame) -> None:
+        act = self._split(act, min_rows=24 * 30)
         idx = wx.index.intersection(act.index)
         wx, act = wx.loc[idx], act.loc[idx]
 
         Xs = self._sf(wx)
-        self.solar_cols = [c for c in Xs.columns]
+        self.solar_cols = list(Xs.columns)
         day = (Xs["sun_elev"] > SUN_MIN) & act["solar"].notna() & Xs["shortwave_radiation"].notna()
         self.solar_cap = float(act["solar"].quantile(0.999) * 1.05)
         self.m_solar = _gbr().fit(Xs.loc[day, self.solar_cols], act.loc[day, "solar"])
         solar_hat = self.predict_solar(wx)
 
-        Xc = self._cf(wx, act["cons"].dropna(), solar_hat)
+        Xc = self._cf(wx, act["base"].dropna(), solar_hat)
         self.cons_cols = list(Xc.columns)
-        ok = act["cons"].notna() & Xc["lag_daily_7d"].notna()
-        self.m_cons = _gbr().fit(Xc.loc[ok, self.cons_cols], act.loc[ok, "cons"])
+        ok = act["base"].notna() & Xc["lag_daily_7d"].notna()
+        self.m_cons = _gbr().fit(Xc.loc[ok, self.cons_cols], act.loc[ok, "base"])
 
-        g = act[["cons", "solar", "grid"]].dropna()
-        Xg = self._gf(g["cons"], g["solar"], g.index, self.tz)
+        self.m_ev = None
+        if act["ev"].notna().sum() > 24 * 30:
+            Xe = self._ef(wx, solar_hat, act["ev"].dropna(), act.get("soc"))
+            self.ev_cols = list(Xe.columns)
+            oke = act["ev"].notna() & Xe["lag_daily_7d"].notna()
+            self.ev_cap = float(act["ev"].max() * 1.05)
+            self.m_ev = _gbr(min_samples_leaf=10).fit(Xe.loc[oke, self.ev_cols], act.loc[oke, "ev"])
+
+        g = act[["cons", "solar", "grid"]].join(act["ev"].fillna(0)).dropna()
+        Xg = self._gf(g["cons"], g["solar"], g["ev"], g.index)
         self.m_grid = _gbr(max_iter=300).fit(Xg[self.grid_cols], g["grid"])
         self.trained_rows = int(day.sum())
 
-    def predict(self, wx: pd.DataFrame, cons_hist: pd.Series) -> pd.DataFrame:
+    def predict(self, wx: pd.DataFrame, hist: pd.DataFrame, live_soc: float | None = None) -> pd.DataFrame:
+        """hist: recent hourly actuals with cons (and ev, soc when available)."""
+        h = self._split(hist) if self.m_ev is not None else self._split(hist.drop(columns="ev", errors="ignore"))
         solar = self.predict_solar(wx)
-        Xc = self._cf(wx, cons_hist, solar)
-        cons = np.clip(self.m_cons.predict(Xc[self.cons_cols]), 0, None)
-        Xg = self._gf(cons, solar.values, wx.index, self.tz)
+        Xc = self._cf(wx, h["base"].dropna(), solar)
+        base = np.clip(self.m_cons.predict(Xc[self.cons_cols]), 0, None)
+        if self.m_ev is not None:
+            Xe = self._ef(wx, solar, h["ev"].dropna(), h.get("soc"))
+            if live_soc is not None:  # today: use the car's current charge level
+                loc = wx.index.tz_convert(self.tz)
+                today = pd.Timestamp.now(tz=self.tz).normalize()
+                Xe.loc[(loc >= today) & (loc < today + pd.Timedelta(days=1)), "soc_eve"] = live_soc
+            ev = np.clip(self.m_ev.predict(Xe[self.ev_cols]), 0, self.ev_cap or None)
+        else:
+            ev = np.zeros(len(wx))
+        cons = base + ev
+        Xg = self._gf(cons, solar.values, ev, wx.index)
         grid = np.clip(self.m_grid.predict(Xg[self.grid_cols]), 0, None)
         grid = np.minimum(grid, cons)  # can't import more than the house uses (no battery)
-        return pd.DataFrame({"solar": solar.values, "cons": cons, "grid": grid}, index=wx.index)
+        return pd.DataFrame({"solar": solar.values, "base": base, "ev": ev, "cons": cons, "grid": grid},
+                            index=wx.index)
+
+    def in_free(self, idx: pd.DatetimeIndex) -> np.ndarray:
+        loc = idx.tz_convert(self.tz)
+        h = loc.hour.values + loc.minute.values / 60
+        return (h >= self.free_start) & (h < self.free_end)
 
     def train(self, wx: pd.DataFrame, actuals: pd.DataFrame, holdout_days: int = 28) -> dict:
         """Backtest on the last `holdout_days` local days, then refit on everything."""
@@ -125,22 +178,26 @@ class Predictor:
             test_mask = (loc_day >= cut) & (loc_day < days[-1])
             self._fit(wx, act[train_mask])
             test_idx = act.index[test_mask].intersection(wx.index)
-            # lag features only look at D-8..D-2, so passing full history mirrors live use
-            pred = self.predict(wx.loc[test_idx], act["cons"].dropna())
+            # lag/state features only look back to the previous evening, so full history mirrors live use
+            pred = self.predict(wx.loc[test_idx], act)
+            a = self._split(act.loc[test_idx]) if self.m_ev is not None else \
+                self._split(act.loc[test_idx].drop(columns="ev", errors="ignore"))
+            free = self.in_free(test_idx)
+            pred["grid_paid"] = np.where(free, 0.0, pred["grid"])
+            a["grid_paid"] = np.where(free, 0.0, a["grid"])
             d = pred.index.tz_convert(self.tz).normalize()
             pdaily = pred.groupby(d).sum()
-            adaily = act.loc[test_idx].groupby(d).sum(min_count=20)
-            bt = {k: accuracy(pdaily[k], adaily[k]) for k in ["solar", "cons", "grid"]}
-            bt["solar_hourly"] = accuracy(pred["solar"], act.loc[test_idx, "solar"])
+            adaily = a.groupby(d).sum(min_count=20)
+            keys = ["solar", "cons", "base", "ev", "grid", "grid_paid"]
+            bt = {k: accuracy(pdaily[k], adaily[k]) for k in keys}
+            bt["solar_hourly"] = accuracy(pred["solar"], a["solar"])
             bt["days"] = int(adaily["solar"].notna().sum())
-            bt["daily"] = [
-                {"date": str(k.date()), "solar_pred": round(pdaily.at[k, "solar"], 1),
-                 "solar_actual": None if pd.isna(adaily.at[k, "solar"]) else round(adaily.at[k, "solar"], 1),
-                 "cons_pred": round(pdaily.at[k, "cons"], 1),
-                 "cons_actual": None if pd.isna(adaily.at[k, "cons"]) else round(adaily.at[k, "cons"], 1)}
-                for k in pdaily.index]
-            log.info("Backtest (%s days): solar %s%%, consumption %s%%, grid %s%%",
-                     bt["days"], bt["solar"], bt["cons"], bt["grid"])
+            r = lambda v: None if pd.isna(v) else round(float(v), 1)  # noqa: E731
+            bt["daily"] = [{"date": str(k.date()), **{f"{c}_pred": r(pdaily.at[k, c]) for c in keys},
+                            **{f"{c}_actual": r(adaily.at[k, c]) for c in keys}} for k in pdaily.index]
+            log.info("Backtest (%s days): solar %s%%, consumption %s%% (base %s%%, EV %s%%), "
+                     "grid %s%%, paid grid %s%%", bt["days"], bt["solar"], bt["cons"], bt["base"],
+                     bt["ev"], bt["grid"], bt["grid_paid"])
         self._fit(wx, act)
         self.backtest = bt
         return bt

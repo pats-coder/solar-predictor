@@ -1,5 +1,5 @@
 name: Solar Predictor
-version: "0.1.2"
+version: "0.2.0"
 slug: solar_predictor
 description: Learns your home's solar production and consumption from HA history and Open-Meteo weather, then forecasts solar, usage and grid draw.
 url: https://github.com/pats-coder/solar-predictor
@@ -16,6 +16,9 @@ options:
   grid_import_stat: sensor.envoy_lifetime_net_energy_consumption
   benchmark_today: sensor.solcast_pv_forecast_forecast_today
   benchmark_tomorrow: sensor.solcast_pv_forecast_forecast_tomorrow
+  ev_power_stat: ""
+  ev_soc_stat: ""
+  ev_soc_entity: ""
   arrays:
     - name: north
       azimuth: 0
@@ -41,6 +44,9 @@ schema:
   grid_import_stat: str
   benchmark_today: str?
   benchmark_tomorrow: str?
+  ev_power_stat: str?
+  ev_soc_stat: str?
+  ev_soc_entity: str?
   arrays:
     - name: str
       azimuth: float

@@ -12,6 +12,7 @@ No Solcast or Forecast.Solar needed.
   from history, so exact panel specs aren't required.
 - **Consumption model:** time of day, weekday/weekend, NSW public holidays, temperature, the past week's
   usage pattern, and forecast solar (solar-driven loads such as pool heating and EV charging).
+- **EV model (optional):** EV charging is metered separately (`ev_power_stat`) and forecast with its own model using the car's charge level (`ev_soc_stat`, live `ev_soc_entity`), solar and the free window; the base-load model then learns the house without the EV.
 - **Grid model:** learns hourly grid import from consumption and solar (captures sub-hourly mismatch).
   An optional hour-by-hour battery simulation applies if `battery_kwh` > 0.
 - **Same-day correction:** scales the rest of today's solar by how today is tracking against forecast.
@@ -24,7 +25,8 @@ No Solcast or Forecast.Solar needed.
 |---|---|
 | `sensor.solar_predictor_solar_today` | Today's solar (actual so far + forecast). Attribute `forecast` = hourly solar, consumption and grid for today and tomorrow |
 | `sensor.solar_predictor_solar_remaining_today` / `_tomorrow` / `_next_hour` | Solar forecasts (kWh) |
-| `sensor.solar_predictor_consumption_today` / `_tomorrow` | Household use (kWh) |
+| `sensor.solar_predictor_consumption_today` / `_tomorrow` | Household use (kWh); attributes split base load vs EV charging |
+| `sensor.solar_predictor_ev_charging_today` / `_tomorrow` | Forecast EV charging (kWh), from the charger meter, car charge level, solar and free window |
 | `sensor.solar_predictor_grid_import_today` / `_tomorrow` | Grid import **outside the free window** (kWh); attribute `including_free_window` |
 | `sensor.solar_predictor_next_grid_draw` | Next hour you're expected to pay for grid power |
 | `sensor.solar_predictor_accuracy_*` | Backtest accuracy, % (daily totals) |

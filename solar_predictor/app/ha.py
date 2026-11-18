@@ -44,6 +44,13 @@ class HA:
     # ---------- websocket statistics ----------
     def hourly_change(self, stat_ids: list[str], start: datetime, end: datetime | None = None) -> pd.DataFrame:
         """Hourly energy change (kWh) per statistic, indexed by UTC hour start."""
+        return self._stats(stat_ids, start, end, "change", {"energy": "kWh"})
+
+    def hourly_mean(self, stat_ids: list[str], start: datetime, end: datetime | None = None) -> pd.DataFrame:
+        """Hourly mean per statistic (power normalised to kW, so kW mean == kWh in that hour)."""
+        return self._stats(stat_ids, start, end, "mean", {"power": "kW"})
+
+    def _stats(self, stat_ids, start, end, kind: str, units: dict) -> pd.DataFrame:
         end = end or datetime.now(timezone.utc)
         frames = []
         chunk = timedelta(days=60)
@@ -61,8 +68,8 @@ class HA:
                 ws.send(json.dumps({
                     "id": msg_id, "type": "recorder/statistics_during_period",
                     "start_time": t.isoformat(), "end_time": t2.isoformat(),
-                    "statistic_ids": stat_ids, "period": "hour", "types": ["change"],
-                    "units": {"energy": "kWh"},
+                    "statistic_ids": stat_ids, "period": "hour", "types": [kind],
+                    "units": units,
                 }))
                 while True:
                     resp = json.loads(ws.recv())
@@ -72,7 +79,10 @@ class HA:
                     raise RuntimeError(f"statistics query failed: {resp}")
                 for sid, rows in resp["result"].items():
                     if rows:
-                        df = pd.DataFrame(rows)[["start", "change"]]
+                        df = pd.DataFrame(rows)
+                        if kind not in df:
+                            continue
+                        df = df[["start", kind]].rename(columns={kind: "value"})
                         df["sid"] = sid
                         frames.append(df)
                 msg_id += 1
@@ -87,5 +97,5 @@ class HA:
             df["start"] = pd.to_datetime(start_col, unit="ms", utc=True)
         else:
             df["start"] = pd.to_datetime(start_col, utc=True)
-        out = df.pivot_table(index="start", columns="sid", values="change", aggfunc="sum")
+        out = df.pivot_table(index="start", columns="sid", values="value", aggfunc="sum")
         return out.reindex(columns=stat_ids)

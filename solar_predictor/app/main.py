@@ -22,7 +22,7 @@ MODEL_PATH = os.path.join(DATA, "model.pkl")
 WX_CACHE = os.path.join(DATA, "weather_hist.pkl")
 TRACK_PATH = os.path.join(DATA, "tracking.json")
 PREFIX = "sensor.solar_predictor_"
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 
 log = logging.getLogger("solar_predictor")
 
@@ -53,7 +53,8 @@ class App:
             try:
                 with open(MODEL_PATH, "rb") as f:
                     saved = pickle.load(f)
-                if saved.get("arrays") == opt["arrays"] and saved.get("version") == VERSION:
+                if (saved.get("arrays") == opt["arrays"] and saved.get("version") == VERSION
+                        and saved.get("ev") == (opt.get("ev_power_stat"), opt.get("ev_soc_stat"))):
                     self.model, self.trained_on = saved["model"], saved["trained_on"]
             except Exception:  # noqa: BLE001
                 log.warning("Saved model unreadable; will retrain")
@@ -65,6 +66,11 @@ class App:
     def actuals(self, start: datetime) -> pd.DataFrame:
         df = self.ha.hourly_change(self.stats, start)
         df.columns = ["solar", "cons", "grid"]
+        extra = {k: self.opt.get(o) for k, o in [("ev", "ev_power_stat"), ("soc", "ev_soc_stat")] if self.opt.get(o)}
+        if extra:
+            m = self.ha.hourly_mean(list(extra.values()), start)
+            m.columns = list(extra.keys())
+            df = df.join(m, how="left")
         return df
 
     def in_free(self, idx: pd.DatetimeIndex) -> np.ndarray:
@@ -87,12 +93,13 @@ class App:
         first = act.dropna(how="all").index.min()
         wx = weather.history(self.lat, self.lon, self.opt["arrays"], first.date(),
                              datetime.now(timezone.utc).date(), WX_CACHE)
-        m = Predictor(self.lat, self.lon, self.tz, self.opt["arrays"], self.hol)
+        m = Predictor(self.lat, self.lon, self.tz, self.opt["arrays"], self.hol,
+                      free_start=hhmm(self.opt["free_start"]), free_end=hhmm(self.opt["free_end"]))
         m.train(wx, act)
         self.model, self.trained_on = m, self.now_local().date()
         with open(MODEL_PATH, "wb") as f:
             pickle.dump({"model": m, "trained_on": self.trained_on, "arrays": self.opt["arrays"],
-                         "version": VERSION}, f)
+                         "version": VERSION, "ev": (self.opt.get("ev_power_stat"), self.opt.get("ev_soc_stat"))}, f)
         log.info("Model trained on %s daylight hours", m.trained_rows)
 
     # ---------- tracking of as-issued forecasts ----------
@@ -154,7 +161,14 @@ class App:
         today0 = now.normalize()
         wx = weather.forecast(self.lat, self.lon, self.opt["arrays"], days=3)
         act = clean(self.actuals(datetime.now(timezone.utc) - timedelta(days=12)))
-        pred = m.predict(wx, act["cons"].dropna())
+        live_soc = None
+        if self.opt.get("ev_soc_entity"):
+            st = self.ha.state(self.opt["ev_soc_entity"])
+            try:
+                live_soc = float(st["state"]) if st else None
+            except (TypeError, ValueError):
+                live_soc = None
+        pred = m.predict(wx, act, live_soc)
 
         # same-day correction of solar from today's actuals so far
         loc_idx = pred.index.tz_convert(self.tz)
@@ -171,6 +185,17 @@ class App:
         future_today = is_today & ~pred.index.isin(done)
         pred.loc[future_today, "solar"] *= corr
 
+        # same-day correction of base load (EV charging excluded)
+        a_base = act["cons"] - (act["ev"].fillna(0) if "ev" in act else 0)
+        b_done = pred.loc[done, "base"].sum()
+        bcorr = 1.0
+        if b_done > 3 and pred.loc[is_today, "base"].sum() > 0:
+            ratio = float(np.clip(a_base.loc[done].sum() / b_done, 0.7, 1.3))
+            w = min(1.0, b_done / (0.5 * pred.loc[is_today, "base"].sum()))
+            bcorr = 1 + w * (ratio - 1)
+        pred.loc[future_today, "base"] *= bcorr
+        pred["cons"] = pred["base"] + pred["ev"]
+
         # battery (optional)
         if self.opt.get("battery_kwh", 0) > 0:
             fut = pred.index >= pd.Timestamp.now(tz="UTC").floor("h")
@@ -181,6 +206,9 @@ class App:
         # merge actuals for completed hours today
         merged = pred.copy()
         merged.loc[done, ["solar", "cons", "grid"]] = act.loc[done, ["solar", "cons", "grid"]].values
+        if "ev" in act:
+            merged.loc[done, "ev"] = act.loc[done, "ev"].fillna(0).values
+        merged.loc[done, "base"] = (merged.loc[done, "cons"] - merged.loc[done, "ev"]).clip(lower=0)
         merged["free"] = self.in_free(merged.index)
         merged["grid_paid"] = np.where(merged["free"], 0.0, merged["grid"])
         merged["actual"] = merged.index.isin(done)
@@ -189,6 +217,7 @@ class App:
             sel = (loc_idx >= day0) & (loc_idx < day0 + pd.Timedelta(days=1))
             s = merged.loc[sel]
             return {"solar": round(s["solar"].sum(), 2), "cons": round(s["cons"].sum(), 2),
+                    "ev": round(s["ev"].sum(), 2), "base": round(s["base"].sum(), 2),
                     "grid": round(s["grid"].sum(), 2), "grid_paid": round(s["grid_paid"].sum(), 2)}
 
         t_today, t_tom = totals(today0), totals(today0 + pd.Timedelta(days=1))
@@ -198,7 +227,7 @@ class App:
         def hourly(day0, days=2):
             sel = (loc_idx >= day0) & (loc_idx < day0 + pd.Timedelta(days=days))
             return [{"start": t.tz_convert(self.tz).isoformat(), "solar": round(r.solar, 3),
-                     "consumption": round(r.cons, 3), "grid": round(r.grid, 3),
+                     "consumption": round(r.cons, 3), "ev_charging": round(r.ev, 3), "grid": round(r.grid, 3),
                      "free_window": bool(r.free), "actual": bool(r.actual)}
                     for t, r in merged.loc[sel].iterrows()]
 
@@ -225,9 +254,14 @@ class App:
         self.put("solar_next_hour", round(float(next_hour.iloc[0]) if len(next_hour) else 0.0, 3),
                  {**kwh, "friendly_name": "Solar Predictor Solar Next Hour", "icon": "mdi:solar-power"})
         self.put("consumption_today", t_today["cons"], {**kwh, "friendly_name": "Solar Predictor Consumption Today",
-                 "icon": "mdi:home-lightning-bolt"})
+                 "icon": "mdi:home-lightning-bolt", "base_load": t_today["base"], "ev_charging": t_today["ev"],
+                 "same_day_correction": round(bcorr, 3)})
         self.put("consumption_tomorrow", t_tom["cons"], {**kwh, "friendly_name": "Solar Predictor Consumption Tomorrow",
-                 "icon": "mdi:home-lightning-bolt"})
+                 "icon": "mdi:home-lightning-bolt", "base_load": t_tom["base"], "ev_charging": t_tom["ev"]})
+        self.put("ev_charging_today", t_today["ev"], {**kwh, "friendly_name": "Solar Predictor EV Charging Today",
+                 "icon": "mdi:ev-station"})
+        self.put("ev_charging_tomorrow", t_tom["ev"], {**kwh, "friendly_name": "Solar Predictor EV Charging Tomorrow",
+                 "icon": "mdi:ev-station"})
         self.put("grid_import_today", t_today["grid_paid"], {**kwh, "friendly_name": "Solar Predictor Paid Grid Import Today",
                  "icon": "mdi:transmission-tower-import", "including_free_window": t_today["grid"]})
         self.put("grid_import_tomorrow", t_tom["grid_paid"], {**kwh, "friendly_name": "Solar Predictor Paid Grid Import Tomorrow",
@@ -240,8 +274,10 @@ class App:
         self.put("accuracy_solar", bt.get("solar", "unknown"), {**pct, "friendly_name": "Solar Predictor Backtest Accuracy Solar",
                  "basis": f"daily totals, last {bt.get('days', 0)} days held out", "hourly_accuracy": bt.get("solar_hourly"),
                  "daily": bt.get("daily", [])})
-        self.put("accuracy_consumption", bt.get("cons", "unknown"), {**pct, "friendly_name": "Solar Predictor Backtest Accuracy Consumption"})
-        self.put("accuracy_grid", bt.get("grid", "unknown"), {**pct, "friendly_name": "Solar Predictor Backtest Accuracy Grid Import"})
+        self.put("accuracy_consumption", bt.get("cons", "unknown"), {**pct, "friendly_name": "Solar Predictor Backtest Accuracy Consumption",
+                 "base_load": bt.get("base"), "ev_charging": bt.get("ev")})
+        self.put("accuracy_grid", bt.get("grid_paid", "unknown"), {**pct, "friendly_name": "Solar Predictor Backtest Accuracy Paid Grid Import",
+                 "all_grid_import": bt.get("grid")})
         da = live.get("dayahead", {})
         self.put("live_accuracy_solar", da.get("solar", "unknown"), {**pct, "friendly_name": "Solar Predictor Live Accuracy Solar (day-ahead, 30d)",
                  "days": da.get("days", 0), "consumption": da.get("cons"), "paid_grid": da.get("grid"),
@@ -251,8 +287,9 @@ class App:
         self.put("status", "ok" if not self.last_error else "error", {"friendly_name": "Solar Predictor Status",
                  "icon": "mdi:check-network-outline", "version": VERSION, "trained_on": str(self.trained_on),
                  "trained_hours": m.trained_rows, "last_update": now.isoformat(), "last_error": self.last_error})
-        log.info("Updated: solar today %.1f (corr %.2f), tomorrow %.1f | use today %.1f, tomorrow %.1f | paid grid %.1f / %.1f",
-                 t_today["solar"], corr, t_tom["solar"], t_today["cons"], t_tom["cons"],
+        log.info("Updated: solar today %.1f (corr %.2f), tomorrow %.1f | use today %.1f (EV %.1f), tomorrow %.1f (EV %.1f)"
+                 " | paid grid %.1f / %.1f", t_today["solar"], corr, t_tom["solar"], t_today["cons"], t_today["ev"],
+                 t_tom["cons"], t_tom["ev"],
                  t_today["grid_paid"], t_tom["grid_paid"])
 
     def run(self) -> None:

@@ -62,8 +62,21 @@ loc = IDX.tz_convert(TZ)
 base = 1.2 + 0.8 * np.isin(loc.hour, [6, 7, 17, 18, 19, 20]) + 0.6 * (loc.dayofweek >= 5)
 cons = base + 0.15 * np.maximum(WX["temperature_2m"] - 24, 0) + 0.25 * solar + rng.normal(0, 0.25, len(IDX))
 cons = cons.clip(lower=0.3)
+# EV: charges 7 kW in the free window when the evening SoC was below 60%, drains 12%/day
+ev = np.zeros(len(IDX))
+soc = np.zeros(len(IDX))
+s_now, charge_today = 70.0, False
+for i, t in enumerate(loc):
+    if t.hour == 0:
+        s_now -= rng.uniform(5, 20)
+        charge_today = s_now < 60
+    if charge_today and 11 <= t.hour < 14:
+        ev[i] = 7.0
+        s_now = min(100, s_now + 9)
+    soc[i] = s_now
+cons = cons + ev
 grid = np.maximum(cons - solar, 0) * 1.08
-ACT = pd.DataFrame({"P": solar, "C": cons, "G": grid}, index=IDX)
+ACT = pd.DataFrame({"P": solar, "C": cons, "G": grid, "EV": ev, "SOC": soc}, index=IDX)
 now_h = pd.Timestamp.now(tz="UTC").floor("h")
 ACT = ACT[ACT.index < now_h - pd.Timedelta(hours=1)]
 
@@ -83,8 +96,12 @@ class FakeHA:
         self.published[eid] = (state, attrs)
 
     def hourly_change(self, ids, start, end=None):
-        a = ACT[ACT.index >= pd.Timestamp(start)]
-        out = a.copy()
+        out = ACT[ACT.index >= pd.Timestamp(start)][["P", "C", "G"]].copy()
+        out.columns = ids
+        return out
+
+    def hourly_mean(self, ids, start, end=None):
+        out = ACT[ACT.index >= pd.Timestamp(start)][["EV", "SOC"]].copy()
         out.columns = ids
         return out
 
@@ -95,6 +112,7 @@ weather.forecast = lambda lat, lon, arrays, days=3: WX[(WX.index >= now_h - pd.T
 
 opt = {"production_stat": "sensor.p", "consumption_stat": "sensor.c", "grid_import_stat": "sensor.g",
        "benchmark_today": "sensor.bt", "benchmark_tomorrow": "sensor.bm", "arrays": ARRAYS,
+       "ev_power_stat": "sensor.ev", "ev_soc_stat": "sensor.soc", "ev_soc_entity": "sensor.soc",
        "free_start": "11:00", "free_end": "14:00", "battery_kwh": 0, "battery_reserve_pct": 10,
        "battery_max_kw": 5, "history_start": "2026-02-01", "holiday_subdiv": "NSW", "update_minutes": 15}
 
@@ -108,6 +126,8 @@ for k, (s, a) in sorted(fake.published.items()):
     print(f"{k:55s} {s}")
 assert bt["solar"] > 85, bt
 assert bt["cons"] > 80, bt
+assert bt["ev"] > 40, {k: v for k, v in bt.items() if k != "daily"}
+assert "sensor.solar_predictor_ev_charging_tomorrow" in fake.published
 fc = fake.published["sensor.solar_predictor_solar_today"][1]["forecast"]
 assert len(fc) == 48, len(fc)
 assert weather.om_azimuth(0) in (180, -180) and weather.om_azimuth(90) == -90 and weather.om_azimuth(270) == 90
