@@ -20,7 +20,7 @@ import features  # noqa: E402
 import main  # noqa: E402
 import weather  # noqa: E402
 
-LAT, LON, TZ = -32.93, 151.75, "Australia/Sydney"
+LAT, LON, TZ = -33.87, 151.21, "Australia/Sydney"
 ARRAYS = [{"name": "north", "azimuth": 0, "tilt": 20}, {"name": "east", "azimuth": 90, "tilt": 20},
           {"name": "west", "azimuth": 270, "tilt": 20}]
 rng = np.random.default_rng(1)
