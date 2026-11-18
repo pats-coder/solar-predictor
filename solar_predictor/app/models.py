@@ -64,6 +64,7 @@ class Predictor:
     grid_cols: list = field(default_factory=lambda: ["cons", "base", "ev", "solar", "deficit", "base_deficit",
                                                      "surplus", "hour", "free"])
     trained_rows: int = 0
+    ev_dayahead: bool = True  # False when the EV model can't beat "no charging" in backtest
     backtest: dict = field(default_factory=dict)
 
     # ---------- features ----------
@@ -129,7 +130,7 @@ class Predictor:
         Xc = self._cf(wx, act["base"].dropna(), solar_hat)
         self.cons_cols = list(Xc.columns)
         ok = act["base"].notna() & Xc["lag_daily_7d"].notna()
-        self.m_cons = _gbr().fit(Xc.loc[ok, self.cons_cols], act.loc[ok, "base"], sample_weight=recency[ok])
+        self.m_cons = _gbr().fit(Xc.loc[ok, self.cons_cols], act.loc[ok, "base"])
 
         self.m_ev = None
         if act["ev"].notna().sum() > 24 * 30:
@@ -167,6 +168,8 @@ class Predictor:
             p_on = clf.predict_proba(Xe[self.ev_cols])[:, 1]
             size = reg.predict(Xe[self.ev_cols]) if reg is not None else np.full(len(Xe), typical)
             ev = np.where(p_on >= 0.5, np.clip(size, 0, self.ev_cap or None), 0.0)
+            if not self.ev_dayahead:
+                ev = np.zeros(len(wx))
         else:
             ev = np.zeros(len(wx))
         cons = base + ev
@@ -215,6 +218,16 @@ class Predictor:
             adaily = a.groupby(d).sum(min_count=20)
             keys = ["solar", "cons", "base", "ev", "grid", "grid_paid"]
             bt = {k: accuracy(pdaily[k], adaily[k]) for k in keys}
+            if self.m_ev is not None and (bt["ev"] is None or bt["ev"] <= 0):
+                # day-ahead EV charging isn't predictable here: assume none and re-score
+                self.ev_dayahead = False
+                pred = self.predict(wx.loc[test_idx], act)
+                pred["grid_paid"] = np.where(free, 0.0, pred["grid"])
+                pdaily = pred.groupby(d).sum()
+                bt = {k: accuracy(pdaily[k], adaily[k]) for k in keys}
+                bt["ev_dayahead"] = False
+            else:
+                bt["ev_dayahead"] = True
             bt["solar_hourly"] = accuracy(pred["solar"], a["solar"])
             bt["days"] = int(adaily["solar"].notna().sum())
             r = lambda v: None if pd.isna(v) else round(float(v), 1)  # noqa: E731
@@ -223,7 +236,9 @@ class Predictor:
             log.info("Backtest (%s days): solar %s%%, consumption %s%% (base %s%%, EV %s%%), "
                      "grid %s%%, paid grid %s%%", bt["days"], bt["solar"], bt["cons"], bt["base"],
                      bt["ev"], bt["grid"], bt["grid_paid"])
+        keep = self.ev_dayahead
         self._fit(wx, act)
+        self.ev_dayahead = keep
         self.backtest = bt
         return bt
 

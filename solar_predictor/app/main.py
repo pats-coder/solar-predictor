@@ -22,7 +22,7 @@ MODEL_PATH = os.path.join(DATA, "model.pkl")
 WX_CACHE = os.path.join(DATA, "weather_hist.pkl")
 TRACK_PATH = os.path.join(DATA, "tracking.json")
 PREFIX = "sensor.solar_predictor_"
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 log = logging.getLogger("solar_predictor")
 
